@@ -354,11 +354,11 @@ def _inherit_launch_model(path) -> bool:
 
 def _mirror_launch_credentials(path, params: dict) -> dict:
     """Copy launch .env / auth.json / voice sections into a new profile (best-effort per item).
-    ``mirror_credentials`` false skips everything. ``model_inherited`` is filled in by the caller.
-
-    ``share_auth`` is accepted from older clients and ignored: a profile never reads the launch
-    profile's auth.json (#111724), so "shared" auth would leave it with no provider at all."""
-    mirrored = {"env": False, "auth": False, "model_inherited": False, "voice": False}
+    ``share_auth`` reports ``auth: "shared"`` and skips the auth copy; ``mirror_credentials``
+    false skips everything. ``model_inherited`` is filled in by the caller."""
+    share_auth = is_truthy_value(params.get("share_auth", False))
+    mirrored = {"env": False, "auth": "shared" if share_auth else False, "model_inherited": False,
+                "voice": False}
     if not is_truthy_value(params.get("mirror_credentials", True)):
         return mirrored
     launch_home = get_hermes_home()
@@ -369,12 +369,13 @@ def _mirror_launch_credentials(path, params: dict) -> dict:
         # Provider/tool keys are what "mirror credentials" means; the launch profile's bot tokens
         # and allowlists would make the new bot collide with it over one Telegram/Discord bot.
         _best_effort(lambda: _lazy("hermes_cli.profile_channels", "strip_channel_env_file")(path / ".env"))
-    mirrored["auth"] = _try(lambda: _mirror_secret(path, launch_home, "auth.json",
-                                                   lambda src, dst: not dst.exists()), False)
-    if mirrored["auth"]:
-        # Drop single-use OAuth grants (a copy forks token state: the first refresh in either store
-        # strands the other); the new profile signs into those providers itself. API keys stay.
-        _best_effort(lambda: _lazy("hermes_cli.auth", "strip_cloned_single_use_oauth_grants")(path))
+    if not share_auth:  # a copy forks token state: the first refresh in either store strands the other
+        mirrored["auth"] = _try(lambda: _mirror_secret(path, launch_home, "auth.json",
+                                                       lambda src, dst: not dst.exists()), False)
+        if mirrored["auth"]:
+            # Drop single-use OAuth grants (first refresh strands every sibling); they read from the
+            # root grant via the pool fallback. API keys stay.
+            _best_effort(lambda: _lazy("hermes_cli.auth", "strip_cloned_single_use_oauth_grants")(path))
     mirrored["voice"] = _mirror_voice_sections(path)
     return mirrored
 
@@ -384,9 +385,8 @@ def _(rid, params: dict) -> dict:
     """Create a profile (ws twin of POST /api/profiles). Params: ``name``, ``description``,
     ``clone_from`` (omitted = fresh + bundled skills), ``clone_all``, ``clone_channels`` (opt-in: keep the
     source's bot tokens/allowlists — default strips them so two profiles never hold one bot), ``no_skills``, ``soul``,
-    ``model`` + ``provider``, ``no_alias``, ``mirror_credentials`` (default true: a bare
-    ``create_profile()`` seeds a comment-only .env and no auth.json = NO provider headless);
-    ``share_auth`` is accepted from older clients and ignored."""
+    ``model`` + ``provider``, ``share_auth``, ``no_alias``, ``mirror_credentials`` (default true: a bare
+    ``create_profile()`` seeds a comment-only .env and no auth.json = NO provider headless)."""
     name = str(params.get("name") or "").strip()
     if not name:
         return _err(rid, 4061, "name required")
@@ -427,9 +427,10 @@ def _describe_toolsets(cfg):
     """``(toolsets, pinned_set)`` as the `hermes tools` checklist presents them (the raw registry
     leaks platform composites and reports everything enabled without a pin)."""
     from hermes_cli.tools_config import (
-        _get_effective_configurable_toolsets, _get_platform_tools, _toolset_allowed_for_platform)
+        _coerce_platform_toolsets_value, _get_effective_configurable_toolsets, _get_platform_tools,
+        _toolset_allowed_for_platform)
     from toolsets import resolve_toolset
-    pinned = (cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}).get("enabled_toolsets")
+    pinned = _coerce_platform_toolsets_value((cfg.get("platform_toolsets") or {}).get("cli"), "cli")
     pinned_set = _clean_names(pinned) if isinstance(pinned, list) else None
     platform_enabled = _try(lambda: set(_get_platform_tools(cfg, "cli", include_default_mcp_servers=False)), set())
     default_off = _try(lambda: _lazy("hermes_cli.tools_config", "_DEFAULT_OFF_TOOLSETS"), set())
@@ -556,13 +557,15 @@ def _clean_names(values) -> set:
 
 
 def _save_toolset_pin(cfg, enabled, save_config) -> None:
-    wanted = sorted(_clean_names(enabled))
-    tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
+    """Pin ``platform_toolsets.cli``: the key ``_load_enabled_toolsets`` reads and ``hermes tools`` writes.
+    An empty selection clears the pin so the platform default applies again."""
+    from hermes_cli.tools_config import _save_platform_tools
+
+    wanted = _clean_names(enabled)
     if wanted:
-        tools_cfg["enabled_toolsets"] = wanted
-    else:
-        tools_cfg.pop("enabled_toolsets", None)
-    cfg["tools"] = tools_cfg
+        _save_platform_tools(cfg, "cli", wanted)
+    elif isinstance(cfg.get("platform_toolsets"), dict):
+        cfg["platform_toolsets"].pop("cli", None)
     save_config(cfg)
 
 
